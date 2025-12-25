@@ -7,6 +7,11 @@ import threading
 import urllib.error
 import urllib.request
 
+try:
+    from tqdm import tqdm
+except ImportError:  # pragma: no cover - runtime dependency
+    tqdm = None
+
 CHUNK_SIZE = 1024 * 1024
 
 
@@ -64,9 +69,9 @@ def split_from_manifest(filename):
     return None
 
 
-def collect_tasks(source_root, output_root):
-    tasks = []
-    missing_urls = []
+def collect_region_tasks(source_root, output_root):
+    tasks_by_region = {}
+    missing_by_region = {}
     for folder_name, dtype in ("DSMs", "dsm"), ("DTMs", "dtm"):
         base_dir = os.path.join(source_root, folder_name)
         if not os.path.isdir(base_dir):
@@ -106,16 +111,16 @@ def collect_tasks(source_root, output_root):
                         output_dir = os.path.join(output_root, split, dtype)
                         output_path = os.path.join(output_dir, output_name)
                         if url is None:
-                            missing_urls.append((region, tile_name))
+                            missing_by_region.setdefault(region, []).append(tile_name)
                             continue
-                        tasks.append(
+                        tasks_by_region.setdefault(region, []).append(
                             {
                                 "region": region,
                                 "url": url,
                                 "output_path": output_path,
                             }
                         )
-    return tasks, missing_urls
+    return tasks_by_region, missing_by_region
 
 
 def get_remote_size(url):
@@ -177,19 +182,36 @@ def download_task(task, failures, lock):
 
 def main():
     args = parse_args()
-    tasks, missing_urls = collect_tasks(args.source_root, args.output_root)
+    if tqdm is None:
+        print("tqdm is required. Please install it with: pip install tqdm")
+        return 1
+
+    tasks_by_region, missing_by_region = collect_region_tasks(
+        args.source_root, args.output_root
+    )
     failures = []
     lock = threading.Lock()
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.threads) as executor:
-        futures = [executor.submit(download_task, task, failures, lock) for task in tasks]
-        for future in concurrent.futures.as_completed(futures):
-            future.result()
-
-    if missing_urls:
-        with lock:
-            for region, tile_name in missing_urls:
-                failures.append((region, f"MISSING_URL:{tile_name}", "not found"))
+        for region, tasks in tasks_by_region.items():
+            missing = missing_by_region.get(region, [])
+            total = len(tasks) + len(missing)
+            if total == 0:
+                continue
+            with tqdm(total=total, desc=region, unit="file") as progress:
+                futures = [
+                    executor.submit(download_task, task, failures, lock)
+                    for task in tasks
+                ]
+                for future in concurrent.futures.as_completed(futures):
+                    future.result()
+                    progress.update(1)
+                for tile_name in missing:
+                    with lock:
+                        failures.append(
+                            (region, f"MISSING_URL:{tile_name}", "not found")
+                        )
+                    progress.update(1)
 
     if failures:
         with open(args.log_file, "w", encoding="utf-8") as handle:
@@ -198,6 +220,7 @@ def main():
         print(f"Finished with {len(failures)} failures. See {args.log_file}.")
     else:
         print("Download completed without failures.")
+    return 0
 
 
 if __name__ == "__main__":
